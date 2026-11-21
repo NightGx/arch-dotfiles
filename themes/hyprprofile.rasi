@@ -1,0 +1,114 @@
+/*
+ * hyprprofile picker - rofi
+ *
+ * Translucent panel with a rounded, accent-coloured border. The accent is
+ * injected at run time (-theme-str '* { accent: #rrggbb; }') from the colour of
+ * the wallpaper currently in use, so the menu tracks the palette it switches.
+ *
+ * The blur behind it comes from a Hyprland layer rule on the "rofi" namespace,
+ * added by snippets/keybind.lua.
+ */
+
+configuration {
+    show-icons:  true;
+    dpi:         0;
+    hover-select: true;
+    me-select-entry: "MousePrimary";
+    me-accept-entry: "!MousePrimary";
+}
+
+* {
+    accent:        #8ab4f8;                 /* overridden per wallpaper */
+    bg:            rgba(16, 16, 22, 62%);
+    bg-alt:        rgba(255, 255, 255, 6%);
+    fg:            #e8e8f0;
+    fg-dim:        rgba(232, 232, 240, 60%);
+    sel:           rgba(255, 255, 255, 10%);
+
+    background-color: transparent;
+    text-color:       @fg;
+    font:             "Rubik 12";
+}
+
+window {
+    transparency:     "real";
+    background-color: @bg;
+    border:           2px;
+    border-radius:    24px;
+    border-color:     @accent;
+    width:            34em;
+    padding:          14px;
+    location:         center;
+    anchor:           center;
+    children:         [ mainbox ];
+}
+
+mainbox {
+    spacing:  10px;
+    children: [ inputbar, listview ];
+}
+
+inputbar {
+    background-color: @bg-alt;
+    border-radius:    18px;
+    padding:          10px 14px;
+    spacing:          10px;
+    children:         [ prompt, entry ];
+}
+
+prompt {
+    text-color: @accent;
+    vertical-align: 0.5;
+}
+
+entry {
+    placeholder:       "type to filter";
+    placeholder-color: @fg-dim;
+    vertical-align:    0.5;
+    cursor:            text;
+}
+
+listview {
+    lines:          9;
+    columns:        1;
+    fixed-height:   false;
+    scrollbar:      false;
+    spacing:        4px;
+    cycle:          true;
+    dynamic:        true;
+}
+
+element {
+    padding:       8px 12px;
+    spacing:       12px;
+    border-radius: 16px;
+    cursor:        pointer;
+    children:      [ element-icon, element-text ];
+}
+
+element normal.normal   { text-color: @fg; }
+element alternate.normal{ text-color: @fg; }
+
+element selected.normal {
+    background-color: @sel;
+    text-color:       @fg;
+    border:           0 0 0 3px;
+    border-color:     @accent;
+    border-radius:    16px;
+}
+
+element-icon {
+    size:             2.6em;
+    border-radius:    10px;
+    vertical-align:   0.5;
+    background-color: transparent;
+}
+
+element-text {
+    vertical-align:   0.5;
+    highlight:        bold @accent;
+    background-color: transparent;
+}
+
+message { padding: 8px; border-radius: 14px; background-color: @bg-alt; }
+textbox { text-color: @fg-dim; }
