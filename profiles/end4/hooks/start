@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Mirrors end-4's hl.on("hyprland.start") block from
+# ~/.config/hypr/hyprland/execs.lua. hyprctl reload does not re-fire that
+# event, so a live switch has to launch these itself.
+set -uo pipefail
+source "$HYPRPROFILE_ROOT/lib/hooklib.sh"
+
+wait_for_wayland || { echo "no wayland socket; giving up"; exit 1; }
+
+QS_CONFIG=${QS_CONFIG:-ii}
+export ILLOGICAL_IMPULSE_VIRTUAL_ENV="${ILLOGICAL_IMPULSE_VIRTUAL_ENV:-$HOME/.local/state/quickshell/.venv}"
+
+if [[ ! -d $ILLOGICAL_IMPULSE_VIRTUAL_ENV ]]; then
+  echo "warning: $ILLOGICAL_IMPULSE_VIRTUAL_ENV missing - run tools/setup-end4-deps.sh"
+fi
+
+# Make the session bus aware of the Wayland display before anything that talks
+# over dbus starts, otherwise portals and the tray come up broken.
+spawn_sh 'dbus-update-activation-environment --all'
+
+# The shell itself: bar, sidebars, overview, notifications, launcher.
+spawn_once "qs -c $QS_CONFIG" qs -c "$QS_CONFIG"
+
+spawn_once 'gnome-keyring-daemon' gnome-keyring-daemon --start --components=secrets
+spawn_once 'hypridle' hypridle
+spawn_once 'easyeffects' easyeffects --hide-window --service-mode
+spawn_once 'start_geoclue_agent' "$HOME/.config/hypr/hyprland/scripts/start_geoclue_agent.sh"
+
+# Clipboard history, one watcher per mime family, each poking quickshell so the
+# clipboard panel refreshes.
+spawn_once_sh 'cliphist store' \
+  "wl-paste --type text --watch bash -c 'cliphist store && qs -c $QS_CONFIG ipc call cliphistService update'"
+spawn_once_sh 'wl-paste --type image' \
+  "wl-paste --type image --watch bash -c 'cliphist store && qs -c $QS_CONFIG ipc call cliphistService update'"
+
+# Video wallpaper restore, if the user set one through the quickshell picker.
+[[ -x $HOME/.config/hypr/custom/scripts/__restore_video_wallpaper.sh ]] &&
+  spawn "$HOME/.config/hypr/custom/scripts/__restore_video_wallpaper.sh"
+
+# Settings every look shares, re-asserted on the way in. The shell config is
+# not a managed path - it is the user's own file and stays put across a switch
+# - so this is a merge of a handful of keys, never a replacement. Chief among
+# them: the top-corner hover/scroll regions, which sit on the overlay layer
+# above the bar and swallow its input.
+baseline="$HYPRPROFILE_ROOT/looks/baseline.json"
+iicfg="${XDG_CONFIG_HOME:-$HOME/.config}/illogical-impulse/config.json"
+if [[ -f $baseline && -f $iicfg ]] && command -v jq >/dev/null 2>&1; then
+  if jq -s '.[0] * .[1]' "$iicfg" "$baseline" >"$iicfg.tmp" && [[ -s $iicfg.tmp ]]; then
+    mv -f "$iicfg.tmp" "$iicfg"
+  else
+    rm -f "$iicfg.tmp"
+    echo "warning: could not apply looks/baseline.json to the shell config" >&2
+  fi
+fi
+
+hyprctl setcursor Bibata-Modern-Classic 24 >/dev/null 2>&1
+
+# Global toolkit settings end-4's installer sets. They are not stored in any
+# config directory, so the symlink swap cannot carry them - set them per
+# switch instead, and the Clean profile's start hook puts them back.
+if command -v gsettings >/dev/null 2>&1; then
+  gsettings set org.gnome.desktop.interface font-name 'Google Sans Flex Medium 11 @opsz=11,wght=500'
+  gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark'
+fi
+command -v kwriteconfig6 >/dev/null 2>&1 &&
+  kwriteconfig6 --file kdeglobals --group KDE --key widgetStyle Darkly
+
+sleep 1
+spawn_sh 'dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP'
+
+exit 0

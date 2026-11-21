@@ -1,0 +1,42 @@
+{
+  "background": {
+    "widgets": {
+      "clock": {
+        "cookie": {
+          "aiStyling": false,
+          "constantlyRotate": false,
+          "dateInClock": true,
+          "dateStyle": "bubble",
+          "dialNumberStyle": "full",
+          "hourHandStyle": "fill",
+          "hourMarks": false,
+          "minuteHandStyle": "medium",
+          "secondHandStyle": "dot",
+          "sides": 14,
+          "timeIndicators": true,
+          "useSineCookie": false
+        },
+        "digital": {
+          "adaptiveAlignment": true,
+          "animateChange": true,
+          "font": {
+            "family": "Google Sans Flex",
+            "roundness": 0,
+            "size": 90,
+            "weight": 350,
+            "width": 100
+          },
+          "showDate": true,
+          "vertical": false
+        },
+        "enable": true,
+        "placementStrategy": "leastBusy",
+        "showOnlyWhenLocked": false,
+        "style": "cookie",
+        "styleLocked": "cookie",
+        "x": 100,
+        "y": 100
+      }
+    }
+  }
+}

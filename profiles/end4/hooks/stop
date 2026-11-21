@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Shut the Quickshell shell and its daemons down. Patterns are specific enough
+# that a plain `qs` a user started by hand for something else survives.
+set -uo pipefail
+source "$HYPRPROFILE_ROOT/lib/hooklib.sh"
+
+QS_CONFIG=${QS_CONFIG:-ii}
+
+stop_match "qs -c $QS_CONFIG"
+stop_match 'cliphist store'
+stop_match 'wl-paste --type image'
+stop_match 'hypridle'
+stop_match 'easyeffects'
+stop_match 'start_geoclue_agent'
+stop_match '__restore_video_wallpaper'
+# mpvpaper/swww-style video wallpapers the quickshell picker may have started
+stop_match 'mpvpaper'
+
+exit 0

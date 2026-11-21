@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Apply a wallpaper for the Material 3 profile.
+#
+# end-4's rice already has the full pipeline for this - switchwall.sh paints
+# through Quickshell, runs matugen, rebuilds the terminal scheme and pokes the
+# Qt/KDE side. Re-implementing any of that here would only drift from it, so
+# this hands over and only fills in when the rice is not fully installed yet.
+#
+# HYPRPROFILE_SCHEME / HYPRPROFILE_MODE come from the look being applied and
+# decide how matugen turns the image into a palette. Unset means "let
+# switchwall decide", which is what a plain `hyprprofile wallpaper` wants.
+set -uo pipefail
+img=${1:-}
+[[ -f $img ]] || { echo "set-wallpaper: no such image: $img" >&2; exit 1; }
+
+export ILLOGICAL_IMPULSE_VIRTUAL_ENV="${ILLOGICAL_IMPULSE_VIRTUAL_ENV:-$HOME/.local/state/quickshell/.venv}"
+switchwall="$HOME/.config/quickshell/ii/scripts/colors/switchwall.sh"
+
+args=(--image "$img")
+case ${HYPRPROFILE_MODE:-} in
+  dark|light) args+=(--mode "$HYPRPROFILE_MODE") ;;
+esac
+case ${HYPRPROFILE_SCHEME:-} in
+  scheme-content|scheme-expressive|scheme-fidelity|scheme-fruit-salad|\
+  scheme-monochrome|scheme-neutral|scheme-rainbow|scheme-tonal-spot|auto)
+    args+=(--type "$HYPRPROFILE_SCHEME") ;;
+  "") ;;
+  *) echo "set-wallpaper: ignoring unknown scheme '$HYPRPROFILE_SCHEME'" >&2 ;;
+esac
+
+if [[ -x $switchwall ]]; then
+  # switchwall reads ~/.config/illogical-impulse/config.json, which Quickshell
+  # writes on first run. Make sure it is there so the wallpaper path sticks.
+  cfg="$HOME/.config/illogical-impulse/config.json"
+  if [[ ! -f $cfg ]]; then
+    mkdir -p "$(dirname "$cfg")"
+    printf '{"background":{"wallpaperPath":""}}\n' >"$cfg"
+  fi
+  "$switchwall" "${args[@]}"
+  rc=$?
+  # Quickshell watches the config file, but nudge it in case it was mid-reload.
+  qs -c ii ipc call wallpaper reload >/dev/null 2>&1 ||
+    qs -c ii ipc call colors reload  >/dev/null 2>&1 || true
+  exit $rc
+fi
+
+echo "set-wallpaper: switchwall.sh not found - run tools/setup-end4-deps.sh" >&2
+command -v matugen >/dev/null 2>&1 && matugen image "$img" >/dev/null 2>&1
+hyprctl reload >/dev/null 2>&1
+exit 0

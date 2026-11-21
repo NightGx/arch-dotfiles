@@ -1,0 +1,10 @@
+{
+  "bar": {
+    "scrollHints": false
+  },
+  "sidebar": {
+    "cornerOpen": {
+      "enable": false
+    }
+  }
+}
