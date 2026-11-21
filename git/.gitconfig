@@ -1,0 +1,43 @@
+[user]
+	email = nightgx8@gmail.com
+	name = Night Gx
+[core]
+    editor = codium
+    autocrlf = input
+
+[init]
+    defaultBranch = main
+
+[pull]
+    rebase = true
+
+[push]
+    autoSetupRemote = true
+
+[alias]
+    # Logs graphiques lisibles et compacts
+    glog = log --graph --pretty=format:'%Cred%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr) %C(bold blue)<%an>%Creset' --abbrev-commit --date=relative --all
+    
+    # Raccourcis usuels
+    st = status -sb
+    co = checkout
+    sw = switch
+    br = branch
+    ci = commit
+    cm = commit -m
+    unstage = reset HEAD --
+    last = log -1 HEAD --stat
+
+# Configuration conditionnelle selon les dossiers de travail
+# (Permet de basculer automatiquement le bon email pour Thomas / IUT)
+[includeIf "gitdir:~/github_backup_TLableigne/"]
+    path = ~/.gitconfig-work
+# 
+# [includeIf "gitdir:~/iut/"]
+#     path = ~/.gitconfig-iut
+[credential "https://github.com"]
+	helper = 
+	helper = !/usr/bin/gh auth git-credential
+[credential "https://gist.github.com"]
+	helper = 
+	helper = !/usr/bin/gh auth git-credential

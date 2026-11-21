@@ -1,0 +1,7 @@
+[user]
+    name = TLableigne
+    email = thom1.lableigne@gmail.com
+
+[core]
+    # Clé SSH dédiée pour pousser par défaut via l'hôte github-thomas
+    sshCommand = ssh -i ~/.ssh/id_ed25519_thomas
