@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Waybar custom module: prints the active style as JSON.
+#
+#   "custom/style": {
+#     "exec": "~/.local/bin/hyprprofile-waybar",
+#     "return-type": "json",
+#     "interval": "once",
+#     "signal": 9,
+#     "on-click": "hyprprofile menu",
+#     "on-click-right": "hyprprofile next",
+#     "on-click-middle": "hyprprofile wallpaper next"
+#   }
+#
+# hyprprofile sends SIGRTMIN+9 to waybar after each switch, so "once" is
+# enough - no polling.
+set -uo pipefail
+
+ROOT="${HYPRPROFILE_ROOT:-${XDG_CONFIG_HOME:-$HOME/.config}/hypr-profiles}"
+
+json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+if [[ ! -L $ROOT/active ]]; then
+  printf '{"text":"?","tooltip":"no style active","class":"none"}\n'
+  exit 0
+fi
+
+name=$(basename "$(readlink "$ROOT/active")")
+conf="$ROOT/profiles/$name/profile.conf"
+
+DISPLAY_NAME=$name; DESCRIPTION=; ICON=
+# shellcheck disable=SC1090
+[[ -f $conf ]] && source "$conf" 2>/dev/null
+
+# The look, read out of the state file the switcher publishes.
+wall=
+[[ -f $ROOT/state/current.json ]] &&
+  wall=$(sed -n 's/.*"wallpaperName":"\([^"]*\)".*/\1/p' "$ROOT/state/current.json")
+
+tooltip="${DESCRIPTION:-$DISPLAY_NAME}"
+look=""
+if [[ -f $ROOT/state/current.json ]]; then
+  look=$(sed -n 's/.*"lookName":"\([^"]*\)".*/\1/p' "$ROOT/state/current.json")
+fi
+if [[ -n $look ]]; then
+  tooltip="$tooltip"$'\n'"Look: $look"
+elif [[ -n $wall ]]; then
+  tooltip="$tooltip"$'\n'"Wallpaper: $wall"
+fi
+
+printf '{"text":"%s","tooltip":"%s","class":"%s","alt":"%s"}\n' \
+  "$(json_escape "${ICON:+$ICON }$DISPLAY_NAME")" \
+  "$(json_escape "$tooltip" | sed ':a;N;$!ba;s/\n/\\n/g')" \
+  "$(json_escape "$name")" \
+  "$(json_escape "$name")"

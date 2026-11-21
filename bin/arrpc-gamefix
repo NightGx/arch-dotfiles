@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""arrpc-gamefix — complete la detection de jeux d'arRPC/Vesktop.
+
+arRPC ne regarde que /proc/PID/cmdline. Sous Proton, argv[0] est souvent
+relatif ("./tlou-ii.exe"), donc les jeux dont la fiche Discord exige un
+chemin avec dossier ("the last of us part ii/tlou-ii.exe") ne matchent
+jamais. Ce demon resout argv[0] contre /proc/PID/cwd et pousse l'activite
+manquante dans la socket arRPC de Vesktop.
+
+Il n'envoie QUE ce qu'arRPC rate deja, donc aucun doublon.
+"""
+import json, os, select, socket, struct, sys, time
+
+DB_PATH = os.path.expanduser("~/.local/share/arrpc-check/detectable.json")
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
+INTERVAL = 5
+
+DB = json.load(open(DB_PATH))
+
+
+def log(*a):
+    print("[gamefix]", *a, flush=True)
+
+
+def processes():
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % pid, errors="replace") as f:
+                raw = f.read().split("\0")
+        except OSError:
+            continue
+        if raw and raw[0]:
+            yield int(pid), raw[0]
+
+
+def resolve(pid, argv0):
+    """Chemin complet: argv0 relatif -> joint au cwd du process."""
+    if argv0.startswith("/") or (len(argv0) > 1 and argv0[1] == ":"):
+        return argv0
+    try:
+        cwd = os.readlink("/proc/%d/cwd" % pid)
+    except OSError:
+        return argv0
+    return os.path.join(cwd, argv0.lstrip("./"))
+
+
+def candidates(path):
+    """Meme algo que arRPC: tous les suffixes du chemin, + variantes 64 bits."""
+    parts = path.lower().replace("\\", "/").split("/")
+    l = ["/".join(parts[-c:]) for c in range(1, len(parts) + 1)]
+    for c in list(l):
+        l += [c.replace("64", ""), c.replace(".x64", ""),
+              c.replace("x64", ""), c.replace("_64", "")]
+    return l
+
+
+def match(cands):
+    if not cands:
+        return None
+    for e in DB:
+        for name, is_launcher in zip(e["executables"], e["launchers"]):
+            if is_launcher:
+                continue
+            hit = (name[1:] == cands[0]) if name.startswith(">") else (name in cands)
+            if hit:
+                return e
+    return None
+
+
+def scan():
+    """Retourne {app_id: (name, pid)} pour les jeux qu'arRPC rate."""
+    found = {}
+    for pid, argv0 in processes():
+        strict = match(candidates(argv0))
+        if strict:
+            continue  # arRPC le voit deja
+        full = resolve(pid, argv0)
+        if full == argv0:
+            continue
+        e = match(candidates(full))
+        if e and e["id"] not in found:
+            found[e["id"]] = (e["name"], pid)
+    return found
+
+
+class Presence:
+    """Une connexion IPC par jeu, comme le ferait le jeu lui-meme."""
+
+    def __init__(self, app_id, name, pid):
+        self.app_id, self.name, self.pid = app_id, name, pid
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(5)
+        self.sock.connect(os.path.join(RUNTIME, "discord-ipc-0"))
+        self._send(0, {"v": 1, "client_id": app_id})
+        self._recv()
+        self._send(1, {"cmd": "SET_ACTIVITY", "nonce": "gamefix-%s" % app_id, "args": {
+            "pid": pid,
+            "activity": {"application_id": app_id, "name": name,
+                         "timestamps": {"start": int(time.time() * 1000)}}}})
+        self._recv()
+
+    def _send(self, op, payload):
+        d = json.dumps(payload).encode()
+        self.sock.sendall(struct.pack("<II", op, len(d)) + d)
+
+    def _recv(self):
+        h = self.sock.recv(8)
+        if len(h) < 8:
+            raise ConnectionError("socket fermee")
+        _, ln = struct.unpack("<II", h)
+        b = b""
+        while len(b) < ln:
+            chunk = self.sock.recv(ln - len(b))
+            if not chunk:
+                raise ConnectionError("socket fermee")
+            b += chunk
+        return json.loads(b)
+
+    def alive(self):
+        """Vesktop redemarre -> la socket meurt en silence; on le detecte ici."""
+        try:
+            r, _, _ = select.select([self.sock], [], [], 0)
+            return not (r and self.sock.recv(1, socket.MSG_PEEK) == b"")
+        except OSError:
+            return False
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def main():
+    active = {}
+    while True:
+        try:
+            found = scan()
+        except Exception as ex:
+            log("erreur de scan:", ex)
+            found = {}
+
+        for app_id in list(active):
+            if app_id not in found:
+                log("jeu ferme:", active[app_id].name)
+                active.pop(app_id).close()
+            elif not active[app_id].alive():
+                log("connexion perdue, on rebranche:", active[app_id].name)
+                active.pop(app_id).close()
+
+        for app_id, (name, pid) in found.items():
+            if app_id in active:
+                continue
+            try:
+                active[app_id] = Presence(app_id, name, pid)
+                log("jeu detecte:", name, "(pid %d)" % pid)
+            except (OSError, ConnectionError) as ex:
+                log("Vesktop injoignable pour %s: %s" % (name, ex))
+
+        time.sleep(INTERVAL)
+
+
+if __name__ == "__main__":
+    if "--once" in sys.argv:
+        for app_id, (name, pid) in scan().items():
+            print("rate par arRPC -> %s (id=%s, pid=%d)" % (name, app_id, pid))
+        sys.exit(0)
+    main()

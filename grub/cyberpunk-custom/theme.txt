@@ -1,0 +1,25 @@
+# Thème Cyberpunk personnalisé - Sans délai ni barre de progression
+title-text: ""
+desktop-image: "background.png"
+desktop-color: "#050811"
+
+# Terminal de secours en cas d'erreur de rendu
+terminal-box: "terminal_box_*.png"
+terminal-font: "Terminus Regular 14"
+
+# Zone de navigation adaptée au 1440p
++ boot_menu {
+  left = 240
+  top = 410
+  width = 920
+  height = 680
+  item_font = "Rajdhani Bold 32"
+  item_color = "#ffffff"
+  selected_item_color = "#000000"
+  icon_width = 64
+  icon_height = 64
+  item_height = 64
+  item_icon_space = 24
+  item_spacing = 10
+  selected_item_pixmap_style = "select_*.png"
+}

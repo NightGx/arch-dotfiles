@@ -1,0 +1,1146 @@
+#!/usr/bin/env bash
+# hyprprofile - live Hyprland rice/profile switcher
+#
+# Keeps several complete Hyprland "rices" side by side and swaps between them
+# without logging out: each profile owns its own copies of the ~/.config,
+# ~/.local/share and ~/.local/state paths it cares about. Switching flips a
+# single `active` symlink, so every owned path repoints at once, then reloads
+# Hyprland and restarts the profile's shell components.
+#
+# It also owns the shared wallpaper set: picking a wallpaper repaints the
+# desktop and regenerates the Material You palette from that image, through
+# whatever mechanism the active profile provides.
+
+set -uo pipefail
+
+ROOT="${HYPRPROFILE_ROOT:-${XDG_CONFIG_HOME:-$HOME/.config}/hypr-profiles}"
+PROFILES_DIR="$ROOT/profiles"
+ACTIVE_LINK="$ROOT/active"
+STATE_DIR="$ROOT/state"
+BACKUP_DIR="$ROOT/backups"
+THEME_DIR="${HYPRPROFILE_THEMES:-$ROOT/themes}"
+LOG_FILE="$STATE_DIR/switch.log"
+LOCK_FILE="$STATE_DIR/lock"
+
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ---------------------------------------------------------------- output ----
+if [[ -t 1 ]]; then
+  C_RST=$'\033[0m'; C_B=$'\033[1m'; C_DIM=$'\033[2m'
+  C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'; C_CYA=$'\033[36m'
+  ON_TTY=1
+else
+  C_RST=; C_B=; C_DIM=; C_RED=; C_GRN=; C_YEL=; C_CYA=
+  ON_TTY=0
+fi
+
+info() { printf '%s==>%s %s\n' "$C_CYA" "$C_RST" "$*" >&2; }
+ok()   { printf '%s  ok%s %s\n' "$C_GRN" "$C_RST" "$*" >&2; }
+
+log() {
+  mkdir -p "$STATE_DIR" 2>/dev/null
+  printf '%s %s\n' "$(date -Is)" "$*" >>"$LOG_FILE" 2>/dev/null
+}
+
+# Notify through whatever is available; never fail the switch over a toast.
+notify() {
+  local title=$1 body=${2:-} urgency=${3:-normal}
+  command -v notify-send >/dev/null 2>&1 &&
+    notify-send -a hyprprofile -u "$urgency" -i preferences-desktop-theme \
+      "$title" "$body" >/dev/null 2>&1 &
+  return 0
+}
+
+# Something worth recording that the user does not need to be told about.
+# Kept separate from warn() because warn() raises a desktop notification, and
+# a switch that fires four toasts about config files you never had is worse
+# than one that says nothing at all.
+note() {
+  printf '%s  --%s %s\n' "$C_DIM" "$C_RST" "$*" >&2
+  log "note: $*"
+}
+
+# Warnings and fatal errors have to reach the user even when nothing is
+# watching stderr - which is the normal case, because the picker is launched
+# from a keybind. Without this a failed switch looks exactly like a no-op.
+warn() {
+  printf '%swarn%s %s\n' "$C_YEL" "$C_RST" "$*" >&2
+  log "warn: $*"
+  (( ON_TTY )) || notify "Style switcher" "$*" normal
+}
+
+die() {
+  printf '%serr %s %s\n' "$C_RED" "$C_RST" "$*" >&2
+  log "error: $*"
+  (( ON_TTY )) || notify "Style switcher failed" "$*" critical
+  exit 1
+}
+
+# --------------------------------------------------------------- helpers ----
+
+hypr_running() {
+  command -v hyprctl >/dev/null 2>&1 || return 1
+  hyprctl version >/dev/null 2>&1
+}
+
+list_profiles() {
+  [[ -d $PROFILES_DIR ]] || return 0
+  local d
+  for d in "$PROFILES_DIR"/*/; do
+    [[ -d $d ]] || continue
+    [[ -f ${d}profile.conf ]] || continue
+    basename "$d"
+  done | sort
+}
+
+profile_exists() { [[ -f "$PROFILES_DIR/$1/profile.conf" ]]; }
+
+current_profile() {
+  [[ -L $ACTIVE_LINK ]] || return 1
+  local t
+  t=$(readlink "$ACTIVE_LINK") || return 1
+  basename "$t"
+}
+
+# Read one profile's metadata into globals. Every field is reset first so a
+# field missing from one profile never leaks in from the previously loaded one.
+load_profile() {
+  local name=$1 conf="$PROFILES_DIR/$1/profile.conf"
+  [[ -f $conf ]] || die "no such profile: $name"
+  NAME=$name
+  DISPLAY_NAME=$name
+  DESCRIPTION=
+  ICON=
+  ACCENT=
+  PICKER=
+  CONFIG_PATHS=()
+  DATA_PATHS=()
+  STATE_PATHS=()
+  REQUIRES=()
+  # shellcheck disable=SC1090
+  source "$conf" || die "failed to read $conf"
+}
+
+# Every managed path, as "<root-kind>:<relative-path>" lines, for the profile
+# whose metadata is currently loaded.
+managed_paths() {
+  local p
+  for p in ${CONFIG_PATHS+"${CONFIG_PATHS[@]}"}; do printf 'config:%s\n' "$p"; done
+  for p in ${DATA_PATHS+"${DATA_PATHS[@]}"};   do printf 'data:%s\n'   "$p"; done
+  for p in ${STATE_PATHS+"${STATE_PATHS[@]}"}; do printf 'state:%s\n'  "$p"; done
+}
+
+managed_paths_of() (
+  load_profile "$1"
+  managed_paths
+)
+
+# Where a "<kind>:<rel>" pair lands in $HOME.
+target_of() {
+  case ${1%%:*} in
+    config) printf '%s/%s\n' "$CONFIG_HOME" "${1#*:}" ;;
+    data)   printf '%s/%s\n' "$DATA_HOME"   "${1#*:}" ;;
+    state)  printf '%s/%s\n' "$STATE_HOME"  "${1#*:}" ;;
+  esac
+}
+
+# ...and where it lives inside the *active* profile. Always routed through the
+# `active` symlink so that flipping that one link repoints every managed path.
+source_of() {
+  printf '%s/%s/%s\n' "$ACTIVE_LINK" "${1%%:*}" "${1#*:}"
+}
+
+# Commands a profile cannot work without. Returns the missing ones, one per
+# line; the caller decides whether that is fatal.
+missing_requires_of() (
+  load_profile "$1"
+  local c
+  for c in ${REQUIRES+"${REQUIRES[@]}"}; do
+    command -v "$c" >/dev/null 2>&1 || printf '%s\n' "$c"
+  done
+)
+
+profile_ready() { [[ -z $(missing_requires_of "$1") ]]; }
+
+json_escape() { local s=${1//\\/\\\\}; printf '%s' "${s//\"/\\\"}"; }
+
+# Machine-readable snapshot of what is active, for bar widgets. A single small
+# file a widget can watch beats every bar shelling out to us on a timer.
+publish_state() {
+  local name=${1:-} wall wallname look lookname
+  [[ -n $name ]] && profile_exists "$name" || return 0
+  wall=$(wp_current 2>/dev/null) || wall=
+  wallname=$([[ -n $wall ]] && wp_name_of "$wall" || printf '')
+  look=$(look_current 2>/dev/null) || look=
+  lookname=$([[ -n $look ]] && look_name_of "$look" || printf '')
+  ( load_profile "$name"
+    printf '{"name":"%s","display":"%s","description":"%s","icon":"%s","wallpaper":"%s","wallpaperName":"%s","look":"%s","lookName":"%s"}\n' \
+      "$(json_escape "$name")" "$(json_escape "$DISPLAY_NAME")" \
+      "$(json_escape "$DESCRIPTION")" "$(json_escape "$ICON")" \
+      "$(json_escape "$wall")" "$(json_escape "$wallname")" \
+      "$(json_escape "$look")" "$(json_escape "$lookname")"
+  ) >"$STATE_DIR/current.json.tmp" && mv -f "$STATE_DIR/current.json.tmp" "$STATE_DIR/current.json"
+}
+
+# True when the path is a symlink we own (points somewhere under $ROOT).
+is_ours() {
+  local link=$1 resolved
+  [[ -L $link ]] || return 1
+  resolved=$(readlink -m "$link")
+  [[ $resolved == "$(readlink -m "$ROOT")"/* ]]
+}
+
+# --------------------------------------------------------------- linking ----
+
+# Move something the user already had at $1 out of the way, once, keeping the
+# whole rescue set of one switch together under a single timestamp.
+rescue() {
+  local target=$1 dest="$BACKUP_DIR/${SWITCH_STAMP:-manual}${1#"$HOME"}"
+  mkdir -p "$(dirname "$dest")"
+  mv "$target" "$dest" || die "could not back up $target"
+  note "backed up pre-existing $target -> $dest"
+  log "backup $target -> $dest"
+}
+
+link_path() {
+  local pair=$1 target src
+  target=$(target_of "$pair")
+  src=$(source_of "$pair")
+
+  # Nothing to link to: the profile declares the path but does not ship it.
+  if [[ ! -e $src && ! -L $src ]]; then
+    note "profile declares ${pair#*:} but has no $src - skipping"
+    return 0
+  fi
+
+  if is_ours "$target"; then
+    # Already one of ours; retarget in case the relative path changed.
+    ln -sfn "$src" "$target"
+    return 0
+  fi
+
+  if [[ -e $target || -L $target ]]; then
+    rescue "$target"
+  fi
+
+  mkdir -p "$(dirname "$target")"
+  ln -sfn "$src" "$target"
+}
+
+unlink_path() {
+  local pair=$1 target
+  target=$(target_of "$pair")
+  # Only ever remove links we created. A real directory there means the user
+  # (or another tool) put it back, and it is not ours to delete.
+  if is_ours "$target"; then
+    rm -f "$target"
+  fi
+}
+
+# ----------------------------------------------------------------- hooks ----
+
+HOOK_TIMEOUT=${HYPRPROFILE_HOOK_TIMEOUT:-20}
+
+run_hook() {
+  local name=$1 hook=$2 path="$PROFILES_DIR/$1/hooks/$2"
+  [[ -x $path ]] || { [[ -f $path ]] && note "hook not executable: $path"; return 0; }
+  info "running $hook hook for $name"
+  log "hook $name/$hook start"
+  mkdir -p "$STATE_DIR"
+  (
+    # Drop the switch lock before handing over. A start hook launches things
+    # that outlive it - a wallpaper daemon, a shell - and every one of them
+    # would otherwise inherit fd 9 and hold the lock for as long as it runs,
+    # so the *next* switch would be refused with "another switch is in
+    # progress" and do nothing at all.
+    exec 9>&-
+    export HYPRPROFILE_NAME="$name"
+    export HYPRPROFILE_ROOT="$ROOT"
+    export HYPRPROFILE_DIR="$PROFILES_DIR/$name"
+    exec "$path"
+  ) </dev/null >>"$LOG_FILE" 2>&1 &
+  local pid=$!
+  # Hooks must not be able to wedge a switch. Stop hooks in particular are
+  # killing processes, which can block on a stuck client.
+  local waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( waited >= HOOK_TIMEOUT * 10 )); then
+      warn "$hook hook for $name exceeded ${HOOK_TIMEOUT}s - continuing without it"
+      log "hook $name/$hook timeout"
+      kill -TERM "$pid" 2>/dev/null
+      return 0
+    fi
+    sleep 0.1
+    waited=$(( waited + 1 ))
+  done
+  wait "$pid"
+  local rc=$?
+  (( rc == 0 )) || warn "$hook hook for $name exited $rc (see $LOG_FILE)"
+  log "hook $name/$hook end rc=$rc"
+  return 0
+}
+
+# ---------------------------------------------------------------- switch ----
+
+# After a reload, Hyprland keeps running the *previous* config if the new one
+# failed to parse - which looks exactly like the switch doing nothing. Ask it.
+config_errors() {
+  hypr_running || return 1
+  local out
+  out=$(hyprctl configerrors 2>/dev/null) || return 1
+  out=$(printf '%s' "$out" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  [[ -z $out || $out == *"no errors"* || $out == "[]" ]] && return 1
+  printf '%s\n' "$out"
+  return 0
+}
+
+# Give the switch lock back and close the descriptor.
+#
+# A one-shot CLI would drop it on exit anyway - but `look` keeps working after
+# the switch, and the wallpaper backend it then runs leaves helpers behind
+# (matugen's KDE wrapper, the terminal-scheme writer). Every one of those would
+# inherit fd 9 and hold the lock for as long as it lives, which is precisely
+# how the first version of this switcher wedged itself.
+unlock() {
+  flock -u 9 2>/dev/null
+  exec 9>&-
+}
+
+cmd_set() {
+  local new=${1:-}
+  [[ -n $new ]] || die "usage: hyprprofile set <profile>"
+  profile_exists "$new" || die "no such profile: $new (try: hyprprofile list)"
+
+  mkdir -p "$STATE_DIR"
+  exec 9>"$LOCK_FILE"
+  # Wait a little rather than failing outright: a switch takes a second or two
+  # and double-tapping the keybind should queue, not error.
+  flock -w 8 9 || die "another switch is still running - try again in a moment"
+
+  local old
+  old=$(current_profile) || old=
+
+  if [[ $old == "$new" && ${FORCE:-0} -eq 0 ]]; then
+    info "$new is already active (use --force to re-apply)"
+    unlock
+    return 0
+  fi
+
+  # Refuse to walk into a rice whose shell is not installed. Doing it anyway
+  # leaves a desktop with no bar and no launcher, and the switcher itself is
+  # then hard to reach - which is exactly the state that is painful to escape.
+  local missing
+  missing=$(missing_requires_of "$new" | tr '\n' ' ')
+  missing=${missing% }
+  if [[ -n $missing ]]; then
+    if (( ${FORCE:-0} )); then
+      warn "$new is missing: $missing - continuing because --force was given"
+    else
+      die "$new needs commands you do not have: $missing. Install them (see tools/setup-end4-deps.sh) or re-run with --force."
+    fi
+  fi
+
+  SWITCH_STAMP=$(date +%Y%m%d-%H%M%S)
+  log "switch $old -> $new"
+  info "switching ${old:-<none>} -> ${C_B}$new${C_RST}"
+
+  # 1. Tear down the outgoing profile's running components first, while its
+  #    config is still in place so its own stop hook can reference it.
+  if [[ -n $old ]] && profile_exists "$old"; then
+    run_hook "$old" stop
+  fi
+
+  # 2. Drop links the new profile does not want. Paths both profiles own are
+  #    left alone - the `active` flip below repoints them for free.
+  local old_paths=() new_paths=() pair
+  if [[ -n $old ]] && profile_exists "$old"; then
+    mapfile -t old_paths < <(managed_paths_of "$old")
+  fi
+  mapfile -t new_paths < <(managed_paths_of "$new")
+
+  for pair in ${old_paths+"${old_paths[@]}"}; do
+    local keep=0 n
+    for n in ${new_paths+"${new_paths[@]}"}; do
+      [[ $n == "$pair" ]] && { keep=1; break; }
+    done
+    (( keep )) || unlink_path "$pair"
+  done
+
+  # 3. Flip the pointer. Done via rename so the link is never briefly absent.
+  ln -sfn "profiles/$new" "$ROOT/.active.new"
+  mv -Tf "$ROOT/.active.new" "$ACTIVE_LINK" || die "failed to activate $new"
+
+  # 4. Materialise the incoming profile's paths.
+  for pair in ${new_paths+"${new_paths[@]}"}; do
+    link_path "$pair"
+  done
+
+  [[ -n $old ]] && printf '%s\n' "$old" >"$STATE_DIR/previous"
+  printf '%s\n' "$new" >"$STATE_DIR/current"
+  publish_state "$new"
+
+  # 5. Reload the compositor, then bring the new profile's shell up.
+  if hypr_running; then
+    info "reloading hyprland"
+    hyprctl reload >/dev/null 2>&1 || warn "hyprctl reload failed - check your config"
+
+    local errs
+    if errs=$(config_errors); then
+      warn "hyprland rejected $new's config:"
+      printf '%s\n' "$errs" >&2
+      log "configerrors after switching to $new: $errs"
+      if [[ -n $old ]] && (( ${FORCE:-0} == 0 )) && profile_exists "$old"; then
+        warn "rolling back to $old"
+        notify "Style switcher" "$new's config did not load - rolled back to $old" critical
+        unlock
+        FORCE=1
+        ROLLING_BACK=1
+        cmd_set "$old"
+        return 1
+      fi
+    fi
+
+    run_hook "$new" start
+  else
+    note "hyprland is not running - files swapped, nothing to reload"
+  fi
+
+  load_profile "$new"
+  ok "now using ${C_B}${DISPLAY_NAME}${C_RST}"
+  [[ ${ROLLING_BACK:-0} == 1 ]] || notify "Style: $DISPLAY_NAME" "$DESCRIPTION"
+
+  refresh_bars
+
+  log "switch done -> $new"
+  unlock
+  return 0
+}
+
+# Nudge any bar that renders the indicator so it repaints without polling.
+refresh_bars() {
+  pkill -u "$UID" -RTMIN+9 waybar 2>/dev/null
+  return 0
+}
+
+# -------------------------------------------------------------- commands ----
+
+cmd_list() {
+  local cur name
+  cur=$(current_profile) || cur=
+  local any=0
+  while read -r name; do
+    [[ -n $name ]] || continue
+    any=1
+    load_profile "$name"
+    local mark="  " colour="$C_RST"
+    if [[ $name == "$cur" ]]; then mark="* "; colour="$C_GRN"; fi
+    printf '%s%s%-14s%s %s%s%s' \
+      "$colour" "$mark" "$name" "$C_RST" "$C_DIM" "$DISPLAY_NAME" "$C_RST"
+    local miss; miss=$(missing_requires_of "$name" | tr '\n' ' ')
+    [[ -n ${miss// /} ]] && printf ' %s(missing: %s)%s' "$C_YEL" "${miss% }" "$C_RST"
+    printf '\n'
+    [[ -n $DESCRIPTION ]] && printf '                 %s%s%s\n' "$C_DIM" "$DESCRIPTION" "$C_RST"
+  done < <(list_profiles)
+  (( any )) || warn "no profiles installed in $PROFILES_DIR"
+}
+
+cmd_current() {
+  local cur
+  cur=$(current_profile) || die "no profile is active"
+  printf '%s\n' "$cur"
+}
+
+cmd_back() {
+  [[ -f $STATE_DIR/previous ]] || die "no previous profile recorded"
+  cmd_set "$(<"$STATE_DIR/previous")"
+}
+
+cmd_next() {
+  local cur profiles=() i
+  mapfile -t profiles < <(list_profiles)
+  (( ${#profiles[@]} > 1 )) || die "need at least two profiles to cycle"
+  cur=$(current_profile) || cur=
+  for i in "${!profiles[@]}"; do
+    if [[ ${profiles[i]} == "$cur" ]]; then
+      cmd_set "${profiles[(i + 1) % ${#profiles[@]}]}"
+      return
+    fi
+  done
+  cmd_set "${profiles[0]}"
+}
+
+# ----------------------------------------------------------------- picker ---
+# Entries are built in three parallel arrays and handed to whichever launcher
+# is available. Selection comes back as an *index*, never as the display
+# string: rofi and fuzzel both trim and re-render rows, so matching the text
+# back to a row is unreliable - and when it fails, the switch silently does
+# nothing, which is indistinguishable from a broken switcher.
+PICK_TEXT=(); PICK_MARKUP=(); PICK_ICON=(); PICK_KEY=()
+
+pick_reset() { PICK_TEXT=(); PICK_MARKUP=(); PICK_ICON=(); PICK_KEY=(); }
+
+pick_add() { # pick_add <key> <plain text> <pango markup> [icon path]
+  PICK_KEY+=("$1"); PICK_TEXT+=("$2"); PICK_MARKUP+=("$3"); PICK_ICON+=("${4:-}")
+}
+
+choose_picker() {
+  local want=${HYPRPROFILE_PICKER:-} cur p
+  if [[ -z $want ]]; then
+    cur=$(current_profile) || cur=
+    # A profile may name the launcher it ships, so the menu looks native in
+    # whichever rice is up rather than always preferring the same binary.
+    [[ -n $cur ]] && want=$( load_profile "$cur" >/dev/null 2>&1; printf '%s' "${PICKER:-}" )
+  fi
+  for p in "$want" fuzzel rofi wofi tofi dmenu; do
+    [[ -n $p ]] && command -v "$p" >/dev/null 2>&1 && { printf '%s\n' "$p"; return 0; }
+  done
+  return 1
+}
+
+# Render the entries for a launcher. Written straight to the pipe because a
+# bash variable cannot carry the NUL that separates a row from its icon.
+pick_feed() { # pick_feed markup|plain
+  local i t
+  for i in "${!PICK_TEXT[@]}"; do
+    if [[ $1 == markup ]]; then t=${PICK_MARKUP[i]}; else t=${PICK_TEXT[i]}; fi
+    if [[ -n ${PICK_ICON[i]} ]]; then
+      printf '%s\0icon\x1f%s\n' "$t" "${PICK_ICON[i]}"
+    else
+      printf '%s\n' "$t"
+    fi
+  done
+}
+
+# Prints the chosen index, or nothing when the user cancelled.
+pick_run() { # pick_run <prompt> <accent hex>
+  local prompt=$1 accent=${2:-#8ab4f8} picker choice i
+  # The caller checks for a picker first: pick_run itself runs inside a command
+  # substitution, where `die` would only kill the subshell.
+  picker=$(choose_picker) || return 1
+
+  case $picker in
+    rofi)
+      local -a base=(-dmenu -i -format i -markup-rows -show-icons -p "$prompt")
+      local -a rargs=("${base[@]}")
+      local theme="${HYPRPROFILE_ROFI_THEME:-$THEME_DIR/hyprprofile.rasi}"
+      if [[ -f $theme ]]; then
+        rargs+=(-no-config -theme "$theme" -theme-str "* { accent: ${accent}; }")
+      fi
+      local errs
+      errs=$(mktemp)
+      choice=$(pick_feed markup | rofi "${rargs[@]}" 2>"$errs")
+      # A theme rofi will not parse makes it exit without drawing anything,
+      # which from a keybind is indistinguishable from the switcher being
+      # broken. Say so, then show the menu with rofi's own theme instead.
+      if [[ -z ${choice:-} && -s $errs ]] && grep -qiE 'error|parse|cannot' "$errs"; then
+        warn "rofi rejected $theme - falling back to your own rofi theme"
+        log "rofi theme error: $(tr '\n' ' ' <"$errs")"
+        choice=$(pick_feed markup | rofi "${base[@]}" 2>/dev/null)
+      fi
+      rm -f "$errs"
+      ;;
+    fuzzel)
+      local -a fargs=(--dmenu --index --prompt "$prompt " --lines "$(( ${#PICK_TEXT[@]} > 12 ? 12 : ${#PICK_TEXT[@]} ))")
+      local fconf="$THEME_DIR/hyprprofile-fuzzel.ini"
+      [[ -f $fconf ]] && fargs+=(--config "$fconf")
+      fargs+=(--border-color "$(hex_to_rgba "$accent" ff)")
+      choice=$(pick_feed plain | fuzzel "${fargs[@]}" 2>/dev/null)
+      ;;
+    *)
+      # No index support: fall back to matching the text back to a row, after
+      # normalising whitespace so a launcher that trims cannot break it.
+      local raw
+      case $picker in
+        wofi) raw=$(printf '%s\n' "${PICK_TEXT[@]}" | wofi --dmenu --prompt "$prompt" 2>/dev/null) ;;
+        tofi) raw=$(printf '%s\n' "${PICK_TEXT[@]}" | tofi --prompt-text "$prompt " 2>/dev/null) ;;
+        *)    raw=$(printf '%s\n' "${PICK_TEXT[@]}" | dmenu -i -p "$prompt" 2>/dev/null) ;;
+      esac
+      [[ -n $raw ]] || return 0
+      local want; want=$(norm "$raw")
+      for i in "${!PICK_TEXT[@]}"; do
+        [[ $(norm "${PICK_TEXT[i]}") == "$want" ]] && { printf '%s\n' "$i"; return 0; }
+      done
+      warn "could not match the selection \"$raw\""
+      return 0
+      ;;
+  esac
+
+  [[ -n ${choice:-} ]] || return 0
+  [[ $choice =~ ^[0-9]+$ ]] || { warn "picker returned \"$choice\" instead of an index"; return 0; }
+  (( choice < ${#PICK_KEY[@]} )) || return 0
+  printf '%s\n' "$choice"
+}
+
+# Collapse the decoration so a launcher that trims or re-renders rows still
+# maps back to the right entry.
+norm() {
+  local s=$1
+  s=${s//●/}; s=${s//○/}; s=${s//│/}
+  s=$(printf '%s' "$s" | tr -s '[:space:]' ' ')
+  s=${s# }; s=${s% }
+  printf '%s' "${s,,}"
+}
+
+hex_to_rgba() { # #rrggbb + aa -> rrggbbaa (fuzzel's format)
+  local h=${1#\#}; printf '%s%s\n' "${h:0:6}" "${2:-ff}"
+}
+
+pango() { # escape text for rofi's markup rows
+  local s=$1
+  s=${s//&/&amp;}; s=${s//</&lt;}; s=${s//>/&gt;}
+  printf '%s' "$s"
+}
+
+dot() { # dot <hex> <active 0|1>
+  local c=$1 on=$2
+  if (( on )); then printf '<span foreground="%s">●</span>' "$c"
+  else                printf '<span foreground="%s" alpha="55%%">○</span>' "$c"; fi
+}
+
+# ------------------------------------------------------------------ menus ---
+
+# The picker the SUPER+Y keybind opens: every look, then the one profile that
+# is not a look. A look row carries its wallpaper as a thumbnail and a dot in
+# its own accent - filled for the one in use, hollow for the rest - so you can
+# see which is which without reading the names.
+cmd_menu() {
+  local what=${1:-all} depth=${2:-0}
+  choose_picker >/dev/null ||
+    die "no picker installed - the menu needs one of fuzzel, rofi, wofi, tofi or dmenu"
+  pick_reset
+
+  local cur lcur accent_now="#8ab4f8"
+  cur=$(current_profile) || cur=
+  lcur=$(look_current 2>/dev/null) || lcur=
+  # Tint the picker's border with the accent of whatever is actually showing.
+  local id nm ac path thumb desc
+  if [[ -n $lcur && $cur == "$LOOK_PROFILE" ]]; then
+    while IFS=$'\t' read -r id nm ac path thumb desc; do
+      [[ $id == "$lcur" ]] && { accent_now=$ac; break; }
+    done < <(look_entries)
+  elif [[ -n $cur ]]; then
+    accent_now=$( load_profile "$cur" >/dev/null 2>&1; printf '%s' "${ACCENT:-#8ab4f8}" )
+  fi
+
+  if [[ $what == all || $what == looks ]]; then
+    while IFS=$'\t' read -r id nm ac path thumb desc; do
+      local on=0
+      [[ $cur == "$LOOK_PROFILE" && $id == "$lcur" ]] && on=1
+      pick_add "look:$id" \
+        "$( (( on )) && printf '\u25cf' || printf '\u25cb' )  $nm" \
+        "$(dot "$ac" $on)  <b>$(pango "$nm")</b>$( [[ -n $desc ]] && printf '  <span alpha="45%%">%s</span>' "$(pango "$desc")" )" \
+        "$thumb"
+    done < <(look_entries)
+  fi
+
+  # Profiles that are not the looks' host - the Clean rice, and anything else
+  # imported later - live below a divider. They are whole desktops, not
+  # repaints, so mixing them into the list above would be a lie. Asking for
+  # `styles` on its own is the other way round: every rice, looks aside.
+  if [[ $what == all || $what == styles ]]; then
+    local others=() name
+    while read -r name; do
+      [[ -n $name ]] || continue
+      [[ $what == styles || $name != "$LOOK_PROFILE" ]] && others+=("$name")
+    done < <(list_profiles)
+    if (( ${#others[@]} )); then
+      (( ${#PICK_KEY[@]} )) && pick_add "noop" "──  other setups  ──" \
+        '<span alpha="35%">─────  other setups  ─────</span>' ""
+      for name in "${others[@]}"; do
+        load_profile "$name"
+        local on=0; [[ $name == "$cur" ]] && on=1
+        local miss suffix=""
+        miss=$(missing_requires_of "$name" | tr '\n' ' '); miss=${miss% }
+        [[ -n $miss ]] && suffix="   (needs $miss)"
+        pick_add "style:$name" \
+          "$( (( on )) && printf '\u25cf' || printf '\u25cb' )  ${DISPLAY_NAME}${suffix}" \
+          "$(dot "${ACCENT:-#8ab4f8}" $on)  <b>$(pango "$DISPLAY_NAME")</b>$(printf '  <span alpha="45%%">%s</span>' "$(pango "${DESCRIPTION}${suffix}")")" \
+          ""
+      done
+    fi
+  fi
+
+  if [[ $what == wallpapers ]]; then
+    while IFS=$'\t' read -r id nm ac path thumb; do
+      local wcur; wcur=$(wp_current 2>/dev/null) || wcur=
+      local on=0; [[ $id == "$wcur" ]] && on=1
+      pick_add "wall:$id" \
+        "$( (( on )) && printf '\u25cf' || printf '\u25cb' )  $nm" \
+        "$(dot "$ac" $on)  $(pango "$nm")" "$thumb"
+    done < <(wp_entries)
+  fi
+
+  (( ${#PICK_KEY[@]} )) || die "nothing to pick from"
+
+  local idx key
+  idx=$(pick_run "style" "$accent_now") || return 1
+  [[ -n ${idx:-} ]] || { info "cancelled"; return 0; }
+
+  key=${PICK_KEY[idx]}
+  case $key in
+    # The divider is not an entry. Re-open the menu so a mis-click is not a
+    # dead end - but count the re-entries, because a picker that keeps handing
+    # back the same row would otherwise spin here forever.
+    noop)    (( depth < 4 )) && cmd_menu "$what" $(( depth + 1 )) ;;
+    look:*)  look_apply "${key#look:}"; publish_state "$(current_profile || true)"; refresh_bars ;;
+    style:*) cmd_set "${key#style:}" ;;
+    wall:*)  wp_apply "${key#wall:}"; publish_state "$cur"; refresh_bars ;;
+  esac
+}
+
+cmd_look() {
+  case ${1:-menu} in
+    list|ls) look_list ;;
+    next)    look_next; publish_state "$(current_profile || true)"; refresh_bars ;;
+    current) look_current || die "no look recorded" ;;
+    new|add) shift; look_new "$@"; publish_state "$(current_profile || true)"; refresh_bars ;;
+    rm|remove|delete) shift; look_rm "$@" ;;
+    menu|"") cmd_menu looks ;;
+    *)       look_apply "$1"; publish_state "$(current_profile || true)"; refresh_bars ;;
+  esac
+}
+
+cmd_wallpaper() {
+  case ${1:-menu} in
+    list|ls) wp_list ;;
+    next)    wp_next; publish_state "$(current_profile || true)"; refresh_bars ;;
+    current) wp_current || die "no wallpaper recorded" ;;
+    menu|"") cmd_menu wallpapers ;;
+    *)       wp_apply "$1"; publish_state "$(current_profile || true)"; refresh_bars ;;
+  esac
+}
+
+cmd_status() {
+  local cur wcur lcur
+  cur=$(current_profile) || cur=
+  lcur=$(look_current 2>/dev/null) || lcur=
+  wcur=$(wp_current 2>/dev/null) || wcur=
+  printf '%sroot%s      %s\n' "$C_B" "$C_RST" "$ROOT"
+  printf '%sactive%s    %s\n' "$C_B" "$C_RST" "${cur:-<none>}"
+  printf '%slook%s      %s\n' "$C_B" "$C_RST" "${lcur:-<none>}"
+  printf '%swallpaper%s %s\n' "$C_B" "$C_RST" "${wcur:-<none>}"
+  [[ -f $STATE_DIR/previous ]] &&
+    printf '%sprevious%s  %s\n' "$C_B" "$C_RST" "$(<"$STATE_DIR/previous")"
+  printf '%shyprland%s  ' "$C_B" "$C_RST"
+  if hypr_running; then hyprctl version | head -1; else printf 'not running\n'; fi
+  [[ -n $cur ]] || return 0
+  printf '\n%smanaged paths%s\n' "$C_B" "$C_RST"
+  local pair target
+  while read -r pair; do
+    [[ -n $pair ]] || continue
+    target=$(target_of "$pair")
+    if is_ours "$target"; then
+      printf '  %sok  %s %s\n' "$C_GRN" "$C_RST" "${target/#$HOME/\~}"
+    elif [[ -e $target ]]; then
+      printf '  %sown %s %s %s(not managed - a real file is there)%s\n' \
+        "$C_YEL" "$C_RST" "${target/#$HOME/\~}" "$C_DIM" "$C_RST"
+    else
+      printf '  %smiss%s %s\n' "$C_RED" "$C_RST" "${target/#$HOME/\~}"
+    fi
+  done < <(managed_paths_of "$cur")
+}
+
+# The one constraint that actually bites: Hyprland decides between
+# hyprland.conf and hyprland.lua once, at startup. If two profiles disagree
+# about the entrypoint, `hyprctl reload` keeps re-reading the format Hyprland
+# booted with and the switch silently does nothing.
+entrypoint_of() {
+  local d="$PROFILES_DIR/$1/config/hypr"
+  if   [[ -f $d/hyprland.lua  ]]; then printf 'lua\n'
+  elif [[ -f $d/hyprland.conf ]]; then printf 'conf\n'
+  else printf 'none\n'; fi
+}
+
+cmd_doctor() {
+  local problems=0 name cur
+  cur=$(current_profile) || cur=
+
+  info "checking profiles"
+  local formats=() f
+  while read -r name; do
+    [[ -n $name ]] || continue
+    f=$(entrypoint_of "$name")
+    case $f in
+      none) printf '  %sFAIL%s %s has no config/hypr/hyprland.{lua,conf}\n' "$C_RED" "$C_RST" "$name"
+            problems=$(( problems + 1 )) ;;
+      *)    printf '  %sok  %s %-14s entrypoint: hyprland.%s\n' "$C_GRN" "$C_RST" "$name" "$f" ;;
+    esac
+    formats+=("$f")
+  done < <(list_profiles)
+
+  local uniq
+  uniq=$(printf '%s\n' ${formats+"${formats[@]}"} | grep -v '^none$' | sort -u | wc -l)
+  if (( uniq > 1 )); then
+    printf '  %sFAIL%s profiles mix hyprland.lua and hyprland.conf entrypoints.\n' "$C_RED" "$C_RST"
+    printf '       Hyprland picks the format once at startup, so switching\n'
+    printf '       between them cannot work without a full Hyprland restart.\n'
+    printf '       Convert every profile to the same format.\n'
+    problems=$(( problems + 1 ))
+  elif (( uniq == 1 )); then
+    ok "all profiles share one entrypoint format"
+  fi
+
+  if hypr_running; then
+    local ver
+    ver=$(hyprctl version | grep -oP 'v?\K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    printf '  %sok  %s hyprland %s\n' "$C_GRN" "$C_RST" "${ver:-unknown}"
+    if [[ ${formats[*]} == *lua* && -n $ver ]]; then
+      local maj min; IFS=. read -r maj min _ <<<"$ver"
+      if (( maj == 0 && min < 55 )); then
+        printf '  %sFAIL%s hyprland %s predates lua config (needs >= 0.55)\n' "$C_RED" "$C_RST" "$ver"
+        problems=$(( problems + 1 ))
+      fi
+    fi
+    local errs
+    if errs=$(config_errors); then
+      printf '  %sFAIL%s hyprland is reporting config errors right now:\n' "$C_RED" "$C_RST"
+      printf '%s\n' "$errs" | sed 's/^/       /'
+      problems=$(( problems + 1 ))
+    else
+      ok "hyprland reports no config errors"
+    fi
+  else
+    note "hyprland not running - skipped version check"
+  fi
+
+  info "checking required commands"
+  while read -r name; do
+    [[ -n $name ]] || continue
+    local missing; missing=$(missing_requires_of "$name" | tr '\n' ' '); missing=${missing% }
+    if [[ -n $missing ]]; then
+      printf '  %sFAIL%s %-14s missing: %s\n' "$C_RED" "$C_RST" "$name" "$missing"
+      printf '       `hyprprofile set %s` will refuse until these exist.\n' "$name"
+      problems=$(( problems + 1 ))
+    else
+      printf '  %sok  %s %-14s all present\n' "$C_GRN" "$C_RST" "$name"
+    fi
+  done < <(list_profiles)
+
+  info "checking the picker"
+  local picker
+  if picker=$(choose_picker); then
+    printf '  %sok  %s menu will use %s\n' "$C_GRN" "$C_RST" "$picker"
+    case $picker in
+      rofi)   [[ -f $THEME_DIR/hyprprofile.rasi ]] ||
+                { printf '  %swarn%s %s is missing - the menu falls back to your rofi theme\n' \
+                  "$C_YEL" "$C_RST" "$THEME_DIR/hyprprofile.rasi"; } ;;
+      fuzzel) [[ -f $THEME_DIR/hyprprofile-fuzzel.ini ]] ||
+                { printf '  %swarn%s %s is missing - the menu falls back to your fuzzel config\n' \
+                  "$C_YEL" "$C_RST" "$THEME_DIR/hyprprofile-fuzzel.ini"; } ;;
+      *)      printf '  %swarn%s %s cannot return a row index; selection falls back to text matching\n' \
+                "$C_YEL" "$C_RST" "$picker" ;;
+    esac
+  else
+    printf '  %sFAIL%s no picker installed (fuzzel, rofi, wofi, tofi or dmenu)\n' "$C_RED" "$C_RST"
+    problems=$(( problems + 1 ))
+  fi
+
+  info "checking wallpapers"
+  local n; n=$(wp_entries | wc -l)
+  if (( n )); then
+    ok "$n wallpaper(s) in $WALLPAPER_DIR"
+    if ! command -v matugen >/dev/null 2>&1; then
+      printf '  %swarn%s matugen is not installed - wallpapers will change the\n' "$C_YEL" "$C_RST"
+      printf '       image but not the colour scheme\n'
+    fi
+    # Rices that draw their own background (Quickshell does) need nothing here;
+    # the rest need a wallpaper daemon or the image will simply not appear.
+    local needs_painter=0 pname
+    while read -r pname; do
+      [[ -n $pname ]] || continue
+      # A Quickshell rice draws its own background and needs no daemon.
+      [[ -d $PROFILES_DIR/$pname/config/quickshell ]] && continue
+      needs_painter=1
+    done < <(list_profiles)
+    if (( needs_painter )) &&
+       ! command -v swww >/dev/null 2>&1 && ! command -v hyprpaper >/dev/null 2>&1; then
+      printf '  %swarn%s no wallpaper daemon (swww or hyprpaper). Styles that do not\n' "$C_YEL" "$C_RST"
+      printf '       draw their own background cannot show a static image.\n'
+      printf '       fix: sudo pacman -S swww\n'
+    fi
+  else
+    printf '  %swarn%s no wallpapers in %s\n' "$C_YEL" "$C_RST" "$WALLPAPER_DIR"
+  fi
+
+  info "checking looks"
+  local nlooks bad_look=0 lid lname lac lpath lthumb ldesc
+  nlooks=$(look_ids | wc -l)
+  if (( nlooks )); then
+    ok "$nlooks look(s) in $LOOKS_DIR"
+    # A look is only as good as the two files behind it: an image that is
+    # actually on disk, and a patch that parses. Both fail silently at apply
+    # time otherwise.
+    while IFS=$'\t' read -r lid lname lac lpath lthumb ldesc; do
+      if [[ -z $lpath ]]; then
+        printf '  %serr %s look %s names a wallpaper that is not in %s\n' \
+          "$C_RED" "$C_RST" "$lid" "$WALLPAPER_DIR"
+        bad_look=1
+      fi
+      local lp="$LOOKS_DIR/$lid/patch.json"
+      if [[ ! -f $lp ]]; then
+        printf '  %swarn%s look %s has no patch.json - it will only set the wallpaper\n' \
+          "$C_YEL" "$C_RST" "$lid"
+      elif command -v jq >/dev/null 2>&1 && ! jq -e . "$lp" >/dev/null 2>&1; then
+        printf '  %serr %s look %s has an unparseable patch.json\n' "$C_RED" "$C_RST" "$lid"
+        bad_look=1
+      fi
+    done < <(look_entries)
+    (( bad_look )) && problems=$(( problems + 1 ))
+
+    # Video wallpapers go through mpvpaper, and their thumbnail and palette
+    # come from a frame ffmpeg pulls out. Only worth saying when one is
+    # actually in the set.
+    local has_video=0 vid
+    while IFS=$'\t' read -r _ _ _ vid _; do
+      case ${vid,,} in *.mp4|*.webm|*.mkv|*.avi|*.mov) has_video=1; break ;; esac
+    done < <(look_entries)
+    if (( has_video )); then
+      command -v mpvpaper >/dev/null 2>&1 || {
+        printf '  %swarn%s a look uses a video wallpaper but mpvpaper is not installed\n' "$C_YEL" "$C_RST"
+        printf '       fix: sudo pacman -S mpvpaper\n'; }
+      command -v ffmpeg >/dev/null 2>&1 || {
+        printf '  %swarn%s ffmpeg is missing - video wallpapers get no thumbnail and\n' "$C_YEL" "$C_RST"
+        printf '       no palette. fix: sudo pacman -S ffmpeg\n'; }
+    fi
+
+    if ! ii_have_merger 2>/dev/null; then
+      printf '  %serr %s looks need jq (or python3) to edit the shell config\n' "$C_RED" "$C_RST"
+      printf '       fix: sudo pacman -S jq\n'
+      problems=$(( problems + 1 ))
+    fi
+    if ! profile_exists "$LOOK_PROFILE"; then
+      printf '  %serr %s looks dress the "%s" profile, which is not installed\n' \
+        "$C_RED" "$C_RST" "$LOOK_PROFILE"
+      problems=$(( problems + 1 ))
+    fi
+    # The corner regions this fixes sit above the bar and steal its input, so
+    # say plainly when the fix is not in place rather than only warning.
+    if [[ -f $II_CONFIG ]] && [[ $(ii_get 'sidebar.cornerOpen.enable') == "true" ]]; then
+      printf '  %swarn%s the top-corner hover/scroll regions are still on - they\n' "$C_YEL" "$C_RST"
+      printf '       overlay the bar. Applying any look turns them off.\n'
+    fi
+  else
+    printf '  %swarn%s no looks in %s\n' "$C_YEL" "$C_RST" "$LOOKS_DIR"
+  fi
+
+  if [[ -n $cur ]]; then
+    info "checking links for active profile ($cur)"
+    local pair target bad=0
+    while read -r pair; do
+      [[ -n $pair ]] || continue
+      target=$(target_of "$pair")
+      if is_ours "$target"; then
+        [[ -e $target ]] || { printf '  %sFAIL%s dangling: %s\n' "$C_RED" "$C_RST" "${target/#$HOME/\~}"; bad=1; }
+      elif [[ -e $target ]]; then
+        printf '  %swarn%s unmanaged: %s\n' "$C_YEL" "$C_RST" "${target/#$HOME/\~}"; bad=1
+      else
+        printf '  %sFAIL%s missing: %s\n' "$C_RED" "$C_RST" "${target/#$HOME/\~}"; bad=1
+      fi
+    done < <(managed_paths_of "$cur")
+    if (( bad )); then
+      problems=$(( problems + 1 ))
+      printf '       run: hyprprofile repair\n'
+    else
+      ok "links healthy"
+    fi
+  fi
+
+  echo
+  if (( problems )); then
+    printf '%swarn%s %s problem(s) found\n' "$C_YEL" "$C_RST" "$problems"
+    return 1
+  fi
+  ok "no problems found"
+}
+
+# Re-apply the active profile's links without touching the compositor.
+cmd_repair() {
+  local cur pair
+  cur=$(current_profile) || die "no profile is active"
+  SWITCH_STAMP=$(date +%Y%m%d-%H%M%S)
+  load_profile "$cur"
+  while read -r pair; do
+    [[ -n $pair ]] || continue
+    link_path "$pair"
+  done < <(managed_paths)
+  ok "relinked $cur"
+}
+
+# Snapshot the live ~/.config state into a brand new profile. This is how an
+# existing rice becomes profile-managed: it *moves* the real directories in,
+# then links them back, so nothing is duplicated and nothing is lost.
+cmd_import() {
+  local name=${1:-}
+  [[ -n $name ]] || die "usage: hyprprofile import <name> [path...]"
+  [[ $name =~ ^[a-zA-Z0-9._-]+$ ]] || die "invalid profile name: $name"
+  ! profile_exists "$name" || die "profile already exists: $name"
+  shift
+
+  local paths=("$@")
+  (( ${#paths[@]} )) || paths=(hypr)
+
+  local dir="$PROFILES_DIR/$name"
+  mkdir -p "$dir/config" "$dir/hooks"
+
+  local p src
+  for p in "${paths[@]}"; do
+    src="$CONFIG_HOME/$p"
+    if [[ -L $src ]]; then warn "$p is already a symlink - skipping"; continue; fi
+    if [[ ! -e $src ]]; then warn "$p does not exist - skipping"; continue; fi
+    mkdir -p "$(dirname "$dir/config/$p")"
+    cp -a "$src" "$dir/config/$p"
+    ok "imported $p"
+  done
+
+  {
+    printf 'DISPLAY_NAME="%s"\n' "$name"
+    printf 'DESCRIPTION="imported from live config on %s"\n' "$(date +%F)"
+    printf 'ICON=""\n'
+    printf 'ACCENT="#8ab4f8"\n'
+    printf 'CONFIG_PATHS=(\n'
+    for p in "${paths[@]}"; do [[ -e $dir/config/$p ]] && printf '  %s\n' "$p"; done
+    printf ')\n'
+    printf 'DATA_PATHS=()\n'
+    printf 'STATE_PATHS=()\n'
+    printf 'REQUIRES=()\n'
+  } >"$dir/profile.conf"
+
+  ok "created profile $name at $dir"
+  info "review $dir/profile.conf, then: hyprprofile set $name"
+}
+
+cmd_help() {
+  cat <<'USAGE'
+hyprprofile - switch between complete Hyprland rices, live.
+
+usage:
+  hyprprofile                        the picker: looks, then other setups
+  hyprprofile menu [looks|wallpapers]
+  hyprprofile look [id|next|list|current]
+                                     wear a look - wallpaper, the palette
+                                     derived from it, and the desktop clock
+  hyprprofile look new <image|video> [--name X] [--clock <look>]
+                       [--scheme <s>] [--accent '#rrggbb'] [--apply]
+                                     make a look out of any image or video:
+                                     copies it in, builds the thumbnail, takes
+                                     the dot colour from the picture, borrows
+                                     a clock from an existing look
+  hyprprofile look rm <id>           take one out of the menu
+  hyprprofile list                   list installed profiles
+  hyprprofile current                print the active profile id
+  hyprprofile set <name> [--force]   switch to a profile
+  hyprprofile next                   cycle to the next profile
+  hyprprofile back                   return to the previous profile
+  hyprprofile wallpaper [id|next|list|current]
+                                     set only the wallpaper, keeping the look's
+                                     clock - mostly a building block for `look`
+  hyprprofile status                 what is active and how the links look
+  hyprprofile doctor                 diagnose entrypoint, deps and link problems
+  hyprprofile repair                 re-create the active profile's links
+  hyprprofile import <name> [dir]    turn the live ~/.config dirs into a profile
+  hyprprofile help                   this message
+
+environment:
+  HYPRPROFILE_ROOT          profile tree (default ~/.config/hypr-profiles)
+  HYPRPROFILE_PICKER        force a picker: fuzzel, rofi, wofi, tofi, dmenu
+  HYPRPROFILE_ROFI_THEME    .rasi theme used when the picker is rofi
+  HYPRPROFILE_THEMES        directory holding the picker themes
+  HYPRPROFILE_WALLPAPERS    wallpaper folder (default <root>/wallpapers)
+  HYPRPROFILE_LOOKS         look folder (default <root>/looks)
+  HYPRPROFILE_LOOK_PROFILE  the profile looks dress (default end4)
+  HYPRPROFILE_II_CONFIG     illogical-impulse config.json a look patches
+  HYPRPROFILE_HOOK_TIMEOUT  seconds before a stuck hook is abandoned (20)
+
+notes:
+  Every profile must use the same Hyprland entrypoint (all hyprland.lua or
+  all hyprland.conf). Hyprland chooses between them once at startup, so a
+  mixed set cannot be switched without restarting Hyprland. `doctor` checks.
+
+  A look is not a profile. Every look is the same desktop - same bar, same
+  keybinds, same launcher - differing only in wallpaper, the palette matugen
+  derives from it, and the clock widget. Switching one needs no reload.
+
+  A switch is refused when the target profile's REQUIRES are not installed,
+  and rolled back when Hyprland rejects the new config, so the picker can
+  never strand you in a desktop with no bar and no launcher.
+USAGE
+}
+
+# ------------------------------------------------------------------ main ----
+
+# The wallpaper half lives in its own file; find it whether we are running
+# from the repo (bin/ + lib/) or from an install ($ROOT/lib/).
+for _lib in "$ROOT/lib/wallpaper.sh" "$SELF_DIR/../lib/wallpaper.sh"; do
+  if [[ -f $_lib ]]; then
+    # shellcheck disable=SC1090
+    source "$_lib"; break
+  fi
+done
+if ! declare -F wp_entries >/dev/null; then
+  wp_entries()  { :; }
+  wp_current()  { return 1; }
+  wp_name_of()  { printf '%s\n' "$1"; }
+  wp_apply()    { die "wallpaper support is not installed (missing lib/wallpaper.sh)"; }
+  wp_next()     { wp_apply x; }
+  wp_list()     { warn "wallpaper support is not installed"; }
+  WALLPAPER_DIR="$ROOT/wallpapers"
+fi
+
+for _lib in "$ROOT/lib/ingest.sh" "$SELF_DIR/../lib/ingest.sh"; do
+  if [[ -f $_lib ]]; then
+    # shellcheck disable=SC1090
+    source "$_lib"; break
+  fi
+done
+
+for _lib in "$ROOT/lib/looks.sh" "$SELF_DIR/../lib/looks.sh"; do
+  if [[ -f $_lib ]]; then
+    # shellcheck disable=SC1090
+    source "$_lib"; break
+  fi
+done
+if ! declare -F look_entries >/dev/null; then
+  look_entries()  { :; }
+  look_ids()      { :; }
+  look_current()  { return 1; }
+  look_exists()   { return 1; }
+  look_name_of()  { printf '%s\n' "$1"; }
+  look_apply()    { die "looks are not installed (missing lib/looks.sh)"; }
+  look_new()      { die "looks are not installed (missing lib/looks.sh)"; }
+  look_rm()       { die "looks are not installed (missing lib/looks.sh)"; }
+  look_next()     { look_apply x; }
+  look_list()     { warn "looks are not installed"; }
+  LOOKS_DIR="$ROOT/looks"
+  LOOK_PROFILE="end4"
+fi
+
+FORCE=0
+args=()
+for a in "$@"; do
+  case $a in
+    --force) FORCE=1 ;;
+    *) args+=("$a") ;;
+  esac
+done
+set -- ${args+"${args[@]}"}
+
+case ${1:-menu} in
+  list|ls)      shift; cmd_list "$@" ;;
+  current|cur)  shift; cmd_current "$@" ;;
+  set|switch|use) shift; cmd_set "$@" ;;
+  next|cycle)   shift; cmd_next "$@" ;;
+  back|prev)    shift; cmd_back "$@" ;;
+  menu|pick)    shift; cmd_menu "$@" ;;
+  look|looks)   shift; cmd_look "$@" ;;
+  wallpaper|wall|wp) shift; cmd_wallpaper "$@" ;;
+  status)       shift; cmd_status "$@" ;;
+  doctor|check) shift; cmd_doctor "$@" ;;
+  repair|relink) shift; cmd_repair "$@" ;;
+  import)       shift; cmd_import "$@" ;;
+  help|-h|--help) cmd_help ;;
+  *) die "unknown command: $1 (try: hyprprofile help)" ;;
+esac
