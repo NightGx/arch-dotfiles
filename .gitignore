@@ -1,0 +1,17 @@
+# Fish history and variables
+fish_variables
+*.fish_history
+
+# Logs and caches
+*.log
+.cache/
+cache/
+tmp/
+*.tmp
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# VSCodium / Editor junk
+.vscode/
